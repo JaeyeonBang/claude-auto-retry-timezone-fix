@@ -1,0 +1,90 @@
+--- a/src/time-parser.js
++++ b/src/time-parser.js
+@@ -81,6 +81,13 @@
+       candidate += diffMin * 60_000;
+     }
+ 
++    // Normalize to the nearest occurrence at or after `now`.
++    // The iterative correction above may land on tomorrow's h:m when today's
++    // h:m is still in the future (e.g., target 22:00 KST when now is 12:56 KST).
++    const nowMs = now.getTime();
++    while (candidate - nowMs >= 86400_000) candidate -= 86400_000;
++    while (candidate < nowMs) candidate += 86400_000;
++
+     return candidate;
+   }
+ 
+@@ -104,3 +111,4 @@
+ 
+   return diff + marginSeconds * 1000;
+ }
++
+--- a/src/config.js
++++ b/src/config.js
+@@ -9,6 +9,10 @@
+   fallbackWaitHours: 5,
+   retryMessage: 'Continue where you left off. The previous attempt was rate limited.',
+   customPatterns: [],
++  // Send a bare Enter before the retry message to dismiss any selection menu
++  // (e.g., Claude's "wait / upgrade plan / restart" prompt after token exhaustion).
++  // Set to 0 to disable.
++  preActionEnterDelaySeconds: 3,
+ };
+ 
+ const CONFIG_PATH = join(homedir(), '.claude-auto-retry.json');
+@@ -33,6 +37,9 @@
+       try { new RegExp(p); return true; } catch { return false; }
+     });
+   }
++  cfg.preActionEnterDelaySeconds = validNumber(
++    cfg.preActionEnterDelaySeconds, 0, DEFAULT_CONFIG.preActionEnterDelaySeconds
++  );
+   if (cfg.foregroundCommands !== undefined) {
+     if (!Array.isArray(cfg.foregroundCommands) || cfg.foregroundCommands.length === 0) {
+       delete cfg.foregroundCommands;
+--- a/src/tmux.js
++++ b/src/tmux.js
+@@ -11,6 +11,8 @@
+   return ['send-keys', '-t', pane, text, 'Enter'];
+ }
+ 
++const SEND_KEYS_ENTER_DELAY_MS = 300;
++
+ export function buildDisplayArgs(pane, format) {
+   return ['display-message', '-t', pane, '-p', format];
+ }
+@@ -31,8 +33,21 @@
+   return stdout;
+ }
+ 
+-export async function sendKeys(pane, text) {
+-  await execFileAsync('tmux', buildSendKeysArgs(pane, text));
++export async function sendKeys(pane, text, preActionEnterDelaySeconds = 0) {
++  // Wake/dismiss any modal prompt by sending a bare Enter first. Claude Code
++  // shows a "wait / upgrade plan / restart" menu when tokens are exhausted;
++  // pressing Enter selects the highlighted default (typically "wait") and
++  // returns to the input prompt so our retry message lands correctly.
++  if (preActionEnterDelaySeconds > 0) {
++    await execFileAsync('tmux', ['send-keys', '-t', pane, 'Enter']);
++    await new Promise((r) => setTimeout(r, preActionEnterDelaySeconds * 1000));
++  }
++  // Split text and Enter to work around Claude Code TUI (Ink/bracketed-paste)
++  // interpreting a batched Enter as a newline instead of submit. See upstream
++  // issue #7.
++  await execFileAsync('tmux', ['send-keys', '-t', pane, text]);
++  await new Promise((r) => setTimeout(r, SEND_KEYS_ENTER_DELAY_MS));
++  await execFileAsync('tmux', ['send-keys', '-t', pane, 'Enter']);
+ }
+ 
+ export async function getPaneCommand(pane) {
+--- a/src/monitor.js
++++ b/src/monitor.js
+@@ -54,7 +54,7 @@
+     // (e.g. pane destroyed) still consumes a retry and avoids tight-loop errors.
+     state.attempts++;
+     state.waitUntil = Date.now() + 30_000;
+-    await tmuxAdapter.sendKeys(pane, config.retryMessage);
++    await tmuxAdapter.sendKeys(pane, config.retryMessage, config.preActionEnterDelaySeconds);
+     return 'retried';
+   }
+ 
